@@ -1,0 +1,85 @@
+name: Run scheduled jobs
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight
+
+jobs:
+  update-kinto-admin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get current version
+        id: current_version
+        run: |
+          CURRENT_VERSION=$(cat kinto/plugins/admin/VERSION)
+          echo "Current Version: $CURRENT_VERSION"
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Get latest release version
+        id: latest_release_version
+        run: |
+          LATEST_RELEASE_VERSION=$(curl -s https://api.github.com/repos/Kinto/kinto-admin/releases/latest | jq -r .tag_name)
+          echo "Latest Version: $LATEST_RELEASE_VERSION"
+          echo "version=${LATEST_RELEASE_VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Compare versions
+        id: compare_versions
+        env:
+          LATEST_RELEASE_VERSION: ${{ steps.latest_release_version.outputs.version }}
+          CURRENT_VERSION: ${{ steps.current_version.outputs.version }}
+        run: |          
+          LATEST_VERSION=$(npx --yes semver "$CURRENT_VERSION" "$LATEST_RELEASE_VERSION" | tail -n 1)
+          if [ "$LATEST_VERSION" != "$CURRENT_VERSION" ]; then 
+            echo "Kinto Admin update ready"
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+          else
+            echo "Kinto Admin up to date"
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure git
+        if: ${{ steps.compare_versions.outputs.update_needed == 'true' }}
+        # https://github.com/orgs/community/discussions/26560
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+      - name: Create branch
+        id: create_branch
+        if: ${{ steps.compare_versions.outputs.update_needed == 'true' }}
+        env:
+          BRANCH_NAME: updates/kinto-admin-${{ steps.latest_release_version.outputs.version }}
+          LATEST_RELEASE: ${{ steps.latest_release_version.outputs.version }}
+        run: |
+          git fetch origin --no-tags --quiet 'refs/heads/updates/*:refs/remotes/origin/updates/*'
+          
+          if [ "$(git rev-parse --quiet --verify origin/$BRANCH_NAME)" ]; then
+            echo "Branch $BRANCH_NAME already exists on origin."
+            echo "pr_needed=false" >> $GITHUB_OUTPUT
+          else
+            git checkout -b "$BRANCH_NAME"
+            echo "$LATEST_RELEASE" > kinto/plugins/admin/VERSION        
+            git commit -am "Update Kinto Admin to $LATEST_RELEASE"
+            git push origin $BRANCH_NAME
+            echo "pr_needed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create pull request
+        if: ${{ steps.compare_versions.outputs.update_needed == 'true' && steps.create_branch.outputs.pr_needed == 'true'}}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: updates/kinto-admin-${{ steps.latest_release_version.outputs.version }}
+        run: |
+          gh pr create \
+            --title "Update Kinto Admin version to ${{ steps.latest_release_version.outputs.version }}" \
+            --body "" \
+            --base "main" \
+            --head "$BRANCH_NAME" \
+            --label "dependencies"
